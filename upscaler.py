@@ -532,8 +532,8 @@ def format_duration(seconds: float) -> str:
     help="Audio upscaling method [default: ai]",
 )
 @click.option(
-    "--codec", type=click.Choice(["h265", "h264"]), default="h265",
-    help="Output video codec [default: h265]",
+    "--codec", type=click.Choice(["h265", "h264"]), default="h264",
+    help="Output video codec [default: h264]",
 )
 @click.option(
     "--model", type=click.Choice(["fast", "quality"]), default="fast",
