@@ -189,7 +189,7 @@ Options:
 ### Examples
 
 ```bash
-# Upscale a Qawwali performance to 720p with face enhancement
+# Upscale a video to 720p with face enhancement
 ./upscale ~/Downloads/example.mp4 --face-enhance
 
 # Fast upscale — skip AI audio, use traditional resampling
@@ -203,7 +203,7 @@ Options:
 
 # Custom output path with all options
 ./upscale ~/Downloads/example.mp4 \
-  -o ~/Desktop/kaiser_hd.mp4 \
+  -o ~/Desktop/example_hd.mp4 \
   -s 2 \
   --audio-mode ai \
   --codec h265 \
@@ -211,6 +211,66 @@ Options:
 
 # Upscale with no denoising
 ./upscale ~/Downloads/concert.mp4 --denoise 0.0
+```
+
+Here's what is outputted by the tool
+
+```bash
+./upscale ~/Downloads/test.mp4 --audio-mode resample                    ─╯
+
+────────────────────────────── AI Video Upscaler ───────────────────────────────
+
+Step 1/7: Analysing input file...
+                      Input File Analysis
+┌───────────────────┬──────────────────────────────────────────┐
+│ File              │ /Users/nadeemshabir/Downloads/test.mp4   │
+│ Resolution        │ 640x352                                  │
+│ FPS               │ 30.000 (30/1)                            │
+│ Duration          │ 669.50s                                  │
+│ Video Codec       │ h264                                     │
+│ Audio Codec       │ aac                                      │
+│ Audio Sample Rate │ 44100 Hz                                 │
+└───────────────────┴──────────────────────────────────────────┘
+Output: /Users/nadeemshabir/Downloads/test_upscaled.mp4
+
+Temp directory:
+/var/folders/pp/jb29wjb54kj02sh3y7k8t8q00000gn/T/upscaler_y050k1fc
+Step 3/7: Extracting audio...
+Audio extracted.
+Step 4/7: Upscaling audio (mode: resample)...
+Audio resampled to 48 kHz using SoX.
+
+Step 5/7: Building upscaling model...
+/Users/nadeemshabir/Development/kiyanwang/upscaler/.venv/lib/python3.12/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.3.0)/charset_normalizer (3.4.6) doesn't match a supported version!
+  warnings.warn(
+Model: SRVGGNetCompact (fast — optimised for video)
+Using Metal/MPS GPU acceleration.
+Model weights will be downloaded automatically on first run.
+Step 5/7: Upscaling video frames...
+Warming up model (MPS shader compilation — this is a one-time cost)...
+Warmup complete in 0.9s.
+Upscaling 20099 frames: 640x352 -> 1280x704
+Processing first frame...
+First frame done in 0.7s. Estimated total: ~3h 59m for 20099 frames.
+  Upscaling video ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 20099/20099 0:46:57 0:00:00
+Upscaled 20099 frames.
+
+Step 6/7: Encoding final video...
+Trying hardware encoder (hevc_videotoolbox)...
+Python(52381) MallocStackLogging: can't turn off malloc stack logging because it was not enabled.
+Video encoded with hardware encoder (hevc_videotoolbox).
+
+Step 7/7: Cleaning up temporary files...
+Temp files removed.
+
+────────────────────────────────────────────────────────────────────── Done ──────────────────────────────────────────────────────────────────────
+                            Upscale Complete
+┌───────────────────┬───────────────────────────────────────────────────┐
+│ Output File       │ /Users/nadeemshabir/Downloads/test_upscaled.mp4 │
+│ Output Resolution │ 1280x704                                          │
+│ File Size         │ 183.6 MB                                          │
+│ Processing Time   │ 48m 7s                                            │
+└───────────────────┴───────────────────────────────────────────────────┘
 ```
 
 ## How It Works
