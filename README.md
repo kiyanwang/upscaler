@@ -16,6 +16,7 @@ All processing happens entirely on your machine — no uploads, no cloud service
 - **Face enhancement** via GFPGAN (restores facial detail in performers, speakers, etc.)
 - **Hardware-accelerated encoding** via Apple VideoToolbox (H.265 / H.264)
 - **MPS GPU acceleration** on Apple Silicon (M1–M4) for Real-ESRGAN inference
+- **Parallel processing** — split work across multiple workers for faster upscaling on multi-core GPUs
 - Rich terminal UI with progress bars, ETA, and summary tables
 
 ## Architecture
@@ -102,10 +103,21 @@ sequenceDiagram
     CLI->>AudioSR: Upscale audio → 48 kHz
     AudioSR-->>CLI: Enhanced waveform
 
-    loop Each frame (with progress bar)
-        CLI->>ESRGAN: Send frame (BGR numpy array)
-        ESRGAN-->>CLI: Upscaled frame
-        CLI->>CLI: Write PNG to temp dir
+    alt Single worker (default)
+        loop Each frame (with progress bar)
+            CLI->>ESRGAN: Send frame (BGR numpy array)
+            ESRGAN-->>CLI: Upscaled frame
+            CLI->>CLI: Write PNG to temp dir
+        end
+    else Multiple workers (-w N)
+        CLI->>CLI: Split frame range into N segments
+        par Worker 1
+            CLI->>ESRGAN: Process frames 0..K
+        and Worker 2
+            CLI->>ESRGAN: Process frames K..2K
+        and Worker N
+            CLI->>ESRGAN: Process frames (N-1)K..total
+        end
     end
 
     CLI->>VTB: Encode frames + audio → MP4
@@ -171,6 +183,7 @@ Options:
   --audio-mode [ai|resample]  Audio upscaling method [default: ai]
   --codec [h265|h264]         Output video codec [default: h265]
   --face-enhance              Enable GFPGAN face restoration
+  -w, --workers INT           Number of parallel workers [default: 1]
   --denoise FLOAT             Denoise strength 0.0-1.0 [default: 0.5]
   --help                      Show this message and exit.
 ```
@@ -184,6 +197,7 @@ Options:
 | `--audio-mode [ai\|resample]` | `ai` | `ai` uses AudioSR (diffusion model) to reconstruct high-frequency audio content. `resample` uses SoX/FFmpeg for fast mathematical resampling. Both output 48 kHz. |
 | `--codec [h265\|h264]` | `h265` | Output video codec. H.265 produces ~50% smaller files at the same quality. Both try hardware encoding (VideoToolbox) first, falling back to software (libx265/libx264). |
 | `--face-enhance` | off | Enables GFPGAN face restoration. Useful for videos with people — restores facial features that AI upscaling alone may miss. |
+| `-w, --workers INT` | `1` | Number of parallel worker processes for video upscaling. Each worker loads its own model instance and processes a contiguous segment of frames. Use 2–3 on Apple Silicon with 16GB+ RAM. |
 | `--denoise FLOAT` | `0.5` | Denoise strength from 0.0 (none) to 1.0 (maximum). The Real-ESRGAN model handles moderate compression noise by default. |
 
 ### Examples
@@ -211,6 +225,12 @@ Options:
 
 # Upscale with no denoising
 ./upscale ~/Downloads/concert.mp4 --denoise 0.0
+
+# Parallel upscale with 2 workers (roughly 1.5-2x faster)
+./upscale ~/Downloads/example.mp4 -w 2
+
+# 3 workers with quality model and face enhancement
+./upscale ~/Downloads/example.mp4 --model quality --face-enhance -w 3 --audio-mode resample
 ```
 
 Here's what is outputted by the tool
@@ -305,6 +325,8 @@ For an 11-minute video at 30fps (~20,000 frames) on Apple M4:
 | 4x | 2560x1408 | 60–120 minutes |
 
 Times vary based on content complexity, tile count, and whether face enhancement is enabled. AI audio upscaling adds a few extra minutes.
+
+With `--workers 2`, expect roughly 1.5–2× speedup. With `--workers 3`, expect roughly 2–2.5×. Speedup is sub-linear due to shared GPU contention.
 
 ## Troubleshooting
 
