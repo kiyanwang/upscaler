@@ -115,7 +115,7 @@ def print_probe_summary(input_path: str, info: dict) -> None:
     console.print(table)
 
 
-def extract_audio(input_path: str, temp_dir: str, sample_rate: int) -> str:
+def extract_audio(input_path: str, temp_dir: str, sample_rate: int, duration: float = None) -> str:
     """Extract audio track to WAV."""
     output_wav = os.path.join(temp_dir, "audio.wav")
     cmd = [
@@ -123,8 +123,10 @@ def extract_audio(input_path: str, temp_dir: str, sample_rate: int) -> str:
         "-vn", "-acodec", "pcm_s16le",
         "-ar", str(sample_rate),
         "-ac", "2",
-        output_wav,
     ]
+    if duration is not None:
+        cmd += ["-t", str(duration)]
+    cmd.append(output_wav)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         console.print(f"[yellow]Warning:[/] Audio extraction failed: {result.stderr.splitlines()[-1] if result.stderr else 'unknown error'}")
@@ -311,6 +313,7 @@ def upscale_video_frames(
     netscale: int,
     denoise: float,
     info: dict,
+    max_frames: int = None,
 ):
     """Read every frame, upscale it, and write to temp PNGs."""
     import cv2
@@ -330,6 +333,8 @@ def upscale_video_frames(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames <= 0:
         total_frames = int(info["duration"] * info["fps"])
+    if max_frames is not None:
+        total_frames = min(total_frames, max_frames)
 
     orig_w, orig_h = info["width"], info["height"]
     target_w = orig_w * scale
@@ -378,6 +383,8 @@ def upscale_video_frames(
 
         frame_idx = 1
         while True:
+            if frame_idx >= total_frames:
+                break
             ret, frame = cap.read()
             if not ret:
                 break
@@ -540,7 +547,11 @@ def format_duration(seconds: float) -> str:
     "--denoise", type=float, default=0.5,
     help="Denoise strength 0.0-1.0 [default: 0.5]",
 )
-def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance, denoise):
+@click.option(
+    "--duration", type=float, default=None,
+    help="Only process the first N seconds (useful for testing)",
+)
+def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance, denoise, duration):
     """AI-powered video and audio upscaler.
 
     Upscales INPUT_PATH using Real-ESRGAN (video) and AudioSR (audio),
@@ -559,6 +570,10 @@ def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance,
     console.print("[bold]Step 1/7:[/] Analysing input file...")
     info = probe_file(input_path)
     print_probe_summary(input_path, info)
+
+    max_frames = int(duration * info["fps"]) if duration else None
+    if duration:
+        console.print(f"[cyan]Duration limit: {duration}s ({max_frames} frames)[/]")
 
     # Resolve output path
     if output_path is None:
@@ -580,7 +595,7 @@ def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance,
         audio_wav = ""
         if info["has_audio"]:
             console.print("[bold]Step 3/7:[/] Extracting audio...")
-            audio_wav = extract_audio(input_path, temp_dir, info["audio_sample_rate"])
+            audio_wav = extract_audio(input_path, temp_dir, info["audio_sample_rate"], duration)
             if audio_wav:
                 console.print("[green]Audio extracted.[/]")
             else:
@@ -616,7 +631,7 @@ def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance,
         frames_dir, target_w, target_h = upscale_video_frames(
             input_path, temp_dir, scale,
             upsampler, face_enhancer_model, netscale,
-            denoise, info,
+            denoise, info, max_frames,
         )
         console.print()
 
