@@ -11,8 +11,11 @@ import sys
 import json
 import time
 import shutil
+import signal
 import subprocess
 import tempfile
+import multiprocessing
+import multiprocessing.queues
 from pathlib import Path
 
 # Must be set before importing torch so MPS fallback ops work
@@ -205,7 +208,7 @@ def upscale_audio_resample(input_wav: str, temp_dir: str) -> str:
     return input_wav  # Return original as last resort
 
 
-def build_upsampler(scale: int, face_enhance: bool, model_mode: str):
+def build_upsampler(scale: int, face_enhance: bool, model_mode: str, quiet: bool = False):
     """Build Real-ESRGAN upsampler (and optional GFPGAN face enhancer)."""
     try:
         import torch
@@ -224,7 +227,8 @@ def build_upsampler(scale: int, face_enhance: bool, model_mode: str):
         )
         model_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth"
         netscale = 4
-        console.print("[cyan]Model: SRVGGNetCompact (fast — optimised for video)[/]")
+        if not quiet:
+            console.print("[cyan]Model: SRVGGNetCompact (fast — optimised for video)[/]")
     else:
         from basicsr.archs.rrdbnet_arch import RRDBNet
         if scale == 2:
@@ -241,20 +245,24 @@ def build_upsampler(scale: int, face_enhance: bool, model_mode: str):
             )
             model_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
             netscale = 4
-        console.print("[cyan]Model: RRDBNet (quality — best detail, slower)[/]")
+        if not quiet:
+            console.print("[cyan]Model: RRDBNet (quality — best detail, slower)[/]")
 
     # Device selection
     if torch.backends.mps.is_available():
         device = torch.device("mps")
-        console.print("[green]Using Metal/MPS GPU acceleration.[/]")
+        if not quiet:
+            console.print("[green]Using Metal/MPS GPU acceleration.[/]")
     else:
         device = torch.device("cpu")
-        console.print("[yellow]MPS not available — falling back to CPU (this will be slow).[/]")
+        if not quiet:
+            console.print("[yellow]MPS not available — falling back to CPU (this will be slow).[/]")
 
     # Half precision is NOT supported on MPS
     use_half = False
 
-    console.print("[dim]Model weights will be downloaded automatically on first run.[/]")
+    if not quiet:
+        console.print("[dim]Model weights will be downloaded automatically on first run.[/]")
 
     upsampler = RealESRGANer(
         scale=netscale,
@@ -278,22 +286,26 @@ def build_upsampler(scale: int, face_enhance: bool, model_mode: str):
                 channel_multiplier=2,
                 bg_upsampler=upsampler,
             )
-            console.print("[green]GFPGAN face enhancement enabled.[/]")
+            if not quiet:
+                console.print("[green]GFPGAN face enhancement enabled.[/]")
         except ImportError:
-            console.print("[yellow]Warning:[/] gfpgan not installed. Face enhancement disabled.")
-            console.print("Install with: pip install gfpgan")
+            if not quiet:
+                console.print("[yellow]Warning:[/] gfpgan not installed. Face enhancement disabled.")
+                console.print("Install with: pip install gfpgan")
         except Exception as exc:
-            console.print(f"[yellow]Warning:[/] GFPGAN setup failed: {exc}")
+            if not quiet:
+                console.print(f"[yellow]Warning:[/] GFPGAN setup failed: {exc}")
 
     return upsampler, face_enhancer, netscale
 
 
-def warmup_model(upsampler, face_enhancer, scale: int) -> None:
+def warmup_model(upsampler, face_enhancer, scale: int, quiet: bool = False) -> None:
     """Run a tiny dummy frame through the model to trigger MPS shader compilation."""
     import cv2
     import numpy as np
 
-    console.print("[dim]Warming up model (MPS shader compilation — this is a one-time cost)...[/]")
+    if not quiet:
+        console.print("[dim]Warming up model (MPS shader compilation — this is a one-time cost)...[/]")
     dummy = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
     t0 = time.time()
     if face_enhancer is not None:
@@ -301,7 +313,8 @@ def warmup_model(upsampler, face_enhancer, scale: int) -> None:
     else:
         upsampler.enhance(dummy, outscale=scale)
     elapsed = time.time() - t0
-    console.print(f"[dim]Warmup complete in {elapsed:.1f}s.[/]")
+    if not quiet:
+        console.print(f"[dim]Warmup complete in {elapsed:.1f}s.[/]")
 
 
 def upscale_video_frames(
@@ -432,6 +445,225 @@ def _enhance_frame(frame, upsampler, face_enhancer, scale: int, frame_idx: int):
     return output
 
 
+def _worker_process(
+    worker_id: int,
+    input_path: str,
+    frames_dir: str,
+    start_frame: int,
+    end_frame: int,
+    scale: int,
+    face_enhance: bool,
+    model_mode: str,
+    denoise: float,
+    needs_resize: bool,
+    target_w: int,
+    target_h: int,
+    progress_queue,  # multiprocessing.Queue
+    barrier,         # multiprocessing.Barrier
+    error_event,     # multiprocessing.Event
+):
+    """Worker process that upscales a contiguous range of video frames.
+
+    Must be a top-level function for multiprocessing 'spawn' pickling.
+    """
+    import cv2
+    import numpy as np
+
+    # Workers should not handle SIGINT — main process manages shutdown
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    cap = None
+    try:
+        # Build model in this process (each worker needs its own instance)
+        upsampler, face_enhancer_model, netscale = build_upsampler(
+            scale, face_enhance, model_mode, quiet=True,
+        )
+        warmup_model(upsampler, face_enhancer_model, scale, quiet=True)
+
+        # Wait for all workers to finish warmup before starting
+        barrier.wait()
+
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Worker {worker_id}: could not open video")
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        for frame_idx in range(start_frame, end_frame):
+            if error_event.is_set():
+                break
+
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            output = _enhance_frame(frame, upsampler, face_enhancer_model, scale, frame_idx)
+
+            if needs_resize:
+                output = cv2.resize(
+                    output, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4,
+                )
+
+            out_path = os.path.join(frames_dir, f"frame_{frame_idx:08d}.png")
+            cv2.imwrite(out_path, output)
+
+            progress_queue.put(("progress", worker_id, frame_idx))
+
+        progress_queue.put(("done", worker_id, None))
+
+    except Exception as exc:
+        progress_queue.put(("error", worker_id, str(exc)))
+        error_event.set()
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def upscale_video_frames_parallel(
+    input_path: str,
+    temp_dir: str,
+    scale: int,
+    face_enhance: bool,
+    model_mode: str,
+    denoise: float,
+    info: dict,
+    max_frames: int = None,
+    num_workers: int = 2,
+):
+    """Upscale video frames using multiple parallel worker processes."""
+    import cv2
+
+    # Calculate total frames (same logic as single-worker path)
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        console.print("[bold red]Error:[/] Could not open video with OpenCV.")
+        sys.exit(1)
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        total_frames = int(info["duration"] * info["fps"])
+    if max_frames is not None:
+        total_frames = min(total_frames, max_frames)
+    cap.release()
+
+    orig_w, orig_h = info["width"], info["height"]
+    target_w = orig_w * scale
+    target_h = orig_h * scale
+    needs_resize = (scale == 3)  # Upsampled at 4x, need to resize to 3x
+
+    frames_dir = os.path.join(temp_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+
+    # Split frames into N contiguous segments
+    chunk_size = total_frames // num_workers
+    segments = []
+    for i in range(num_workers):
+        start = i * chunk_size
+        if i == num_workers - 1:
+            end = total_frames  # last worker gets remainder
+        else:
+            end = (i + 1) * chunk_size
+        segments.append((start, end))
+
+    progress_queue = multiprocessing.Queue()
+    barrier = multiprocessing.Barrier(num_workers)
+    error_event = multiprocessing.Event()
+
+    console.print(
+        f"[bold]Spawning {num_workers} workers to upscale {total_frames} frames: "
+        f"{orig_w}x{orig_h} -> {target_w}x{target_h}[/]"
+    )
+
+    # Save original SIGINT handler and install one that shuts down workers
+    original_sigint = signal.getsignal(signal.SIGINT)
+    processes = []
+
+    def _sigint_handler(sig, frame):
+        error_event.set()
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    # Spawn worker processes
+    for i, (start, end) in enumerate(segments):
+        p = multiprocessing.Process(
+            target=_worker_process,
+            args=(
+                i, input_path, frames_dir, start, end,
+                scale, face_enhance, model_mode, denoise,
+                needs_resize, target_w, target_h,
+                progress_queue, barrier, error_event,
+            ),
+            daemon=False,
+        )
+        processes.append(p)
+        p.start()
+
+    # Progress bar loop — consume messages from workers
+    completed = 0
+    workers_done = 0
+    had_error = False
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Upscaling video", total=total_frames)
+
+        while workers_done < num_workers and not had_error:
+            try:
+                msg_type, wid, payload = progress_queue.get(timeout=0.1)
+            except Exception:
+                # queue.Empty — just keep polling
+                continue
+
+            if msg_type == "progress":
+                completed += 1
+                progress.update(task, completed=completed)
+            elif msg_type == "done":
+                workers_done += 1
+            elif msg_type == "error":
+                console.print(
+                    f"\n[bold red]Error in worker {wid}:[/] {payload}"
+                )
+                had_error = True
+                error_event.set()
+                for p in processes:
+                    if p.is_alive():
+                        p.terminate()
+
+    # Join all processes
+    for p in processes:
+        p.join(timeout=10)
+
+    # Restore original SIGINT handler
+    signal.signal(signal.SIGINT, original_sigint)
+
+    if had_error:
+        console.print("[bold red]Parallel upscaling failed due to worker error.[/]")
+        sys.exit(1)
+
+    # Verify frame count
+    actual_frames = len([
+        f for f in os.listdir(frames_dir) if f.endswith(".png")
+    ])
+    if actual_frames != total_frames:
+        console.print(
+            f"[yellow]Warning:[/] Expected {total_frames} frames but found "
+            f"{actual_frames} in output directory."
+        )
+
+    console.print(f"[green]Upscaled {actual_frames} frames.[/]")
+    return frames_dir, target_w, target_h
+
+
 def reassemble_video(
     frames_dir: str,
     audio_path: str,
@@ -551,7 +783,11 @@ def format_duration(seconds: float) -> str:
     "--duration", type=float, default=None,
     help="Only process the first N seconds (useful for testing)",
 )
-def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance, denoise, duration):
+@click.option(
+    "-w", "--workers", type=int, default=1,
+    help="Number of parallel workers for video upscaling [default: 1]",
+)
+def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance, denoise, duration, workers):
     """AI-powered video and audio upscaler.
 
     Upscales INPUT_PATH using Real-ESRGAN (video) and AudioSR (audio),
@@ -624,15 +860,23 @@ def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance,
         # -------------------------------------------------------------------
         # Step 5: Upscale video
         # -------------------------------------------------------------------
-        console.print("[bold]Step 5/7:[/] Building upscaling model...")
-        upsampler, face_enhancer_model, netscale = build_upsampler(scale, face_enhance, model)
+        if workers == 1:
+            # Single-worker path (original behaviour, no overhead)
+            console.print("[bold]Step 5/7:[/] Building upscaling model...")
+            upsampler, face_enhancer_model, netscale = build_upsampler(scale, face_enhance, model)
 
-        console.print("[bold]Step 5/7:[/] Upscaling video frames...")
-        frames_dir, target_w, target_h = upscale_video_frames(
-            input_path, temp_dir, scale,
-            upsampler, face_enhancer_model, netscale,
-            denoise, info, max_frames,
-        )
+            console.print("[bold]Step 5/7:[/] Upscaling video frames...")
+            frames_dir, target_w, target_h = upscale_video_frames(
+                input_path, temp_dir, scale,
+                upsampler, face_enhancer_model, netscale,
+                denoise, info, max_frames,
+            )
+        else:
+            console.print(f"[bold]Step 5/7:[/] Upscaling video frames with {workers} parallel workers...")
+            frames_dir, target_w, target_h = upscale_video_frames_parallel(
+                input_path, temp_dir, scale, face_enhance, model,
+                denoise, info, max_frames, num_workers=workers,
+            )
         console.print()
 
         # -------------------------------------------------------------------
@@ -685,4 +929,5 @@ def main(input_path, output_path, scale, audio_mode, codec, model, face_enhance,
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
     main()
