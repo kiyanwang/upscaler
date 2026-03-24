@@ -468,21 +468,22 @@ def reassemble_video(
         cmd += ["-movflags", "+faststart", output_path]
         return cmd
 
-    # Try hardware encoder first
-    console.print(f"[dim]Trying hardware encoder ({hw_encoder})...[/]")
-    cmd = _build_cmd(hw_encoder, is_hw=True)
+    # Use software encoder for maximum compatibility (QuickTime, etc.)
+    console.print(f"[dim]Encoding with {sw_encoder}...[/]")
+    cmd = _build_cmd(sw_encoder, is_hw=False)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode == 0:
-        console.print(f"[green]Video encoded with hardware encoder ({hw_encoder}).[/]")
+        console.print(f"[green]Video encoded with {sw_encoder}.[/]")
         return
 
-    console.print(f"[yellow]Hardware encoder unavailable, falling back to {sw_encoder}.[/]")
-    cmd = _build_cmd(sw_encoder, is_hw=False)
+    # Fall back to hardware encoder if software fails
+    console.print(f"[yellow]Software encoder failed, trying hardware encoder ({hw_encoder})...[/]")
+    cmd = _build_cmd(hw_encoder, is_hw=True)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         console.print(f"[bold red]Error:[/] FFmpeg encoding failed:\n{result.stderr}")
         sys.exit(1)
-    console.print(f"[green]Video encoded with {sw_encoder}.[/]")
+    console.print(f"[green]Video encoded with hardware encoder ({hw_encoder}).[/]")
 
 
 def format_size(size_bytes: int) -> str:
